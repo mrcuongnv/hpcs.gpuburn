@@ -1,12 +1,19 @@
-CUDAPATH=/usr/local/cuda
+CUDA_HOME=/usr/local/cuda
+CXX=g++
+NVCC=$(CUDA_HOME)/bin/nvcc
+GCC5_HOME=/opt/gcc/5.4.0
 
-# Have this point to an old enough gcc (for nvcc)
-GCCPATH=/opt/gcc/5.4.0
+CXXFLAGS=-O3 -Wno-unused-result -I${CUDA_HOME}/include
+LDLIBS=-L${CUDA_HOME}/lib64/stubs -lcuda -L${CUDA_HOME}/lib64 -L${CUDA_HOME}/lib -Wl,-rpath=${CUDA_HOME}/lib64 -Wl,-rpath=${CUDA_HOME}/lib -lcublas -lcudart
 
-NVCC=nvcc
-CCPATH=${GCCPATH}/bin
+hpcs.gpuburn: gpuburn.o
+	$(CXX) $(CXXFLAGS) -o hpcs.gpuburn gpuburn.o $(LDLIBS)
 
-drv:
-	PATH="${CUDAPATH}/bin:.:${CCPATH}:${PATH}" ${NVCC} -ptx compare.cu -o compare.ptx
-	g++ -O3 -Wno-unused-result -I${CUDAPATH}/include -c gpu_burn-drv.cpp
-	g++ -o gpu_burn gpu_burn-drv.o -O3 -L${CUDAPATH}/lib64/stubs -lcuda -L${CUDAPATH}/lib64 -L${CUDAPATH}/lib -Wl,-rpath=${CUDAPATH}/lib64 -Wl,-rpath=${CUDAPATH}/lib -lcublas -lcudart -o gpu_burn
+gpuburn.o: gpuburn.cpp compare.ptx
+	$(CXX) $(CXXFLAGS) -c gpuburn.cpp
+
+compare.ptx: compare.cu
+	PATH="$(GCC5_HOME)/bin:$(PATH)" $(NVCC) -std=c++11 -ptx compare.cu -o compare.ptx
+
+clean:
+	rm -f compare.ptx *.o hpcs.gpuburn
