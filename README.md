@@ -9,16 +9,14 @@ From http://wili.cc/blog/gpu-burn.html
 
 ## Usage
 
-Syntax:
-
 ```
-gpu_burn [-d] [duration=10]
-```
+Usage: hpcs.gpuburn [-d] [-t] [-s 10]
 
 Options
-
-* `-d`: use `double` instead of default `float`.
-* `duration`: the running length in seconds. Default is 10 seconds.
+    -d  Use double precision (default: single precision).
+    -t  Print performance as Tflops (default: Gflops).
+    -s  Benchmark duration in seconds (default: 10 seconds).
+```
 
 ## Disclaimer
 
