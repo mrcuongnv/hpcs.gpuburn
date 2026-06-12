@@ -1,12 +1,33 @@
-CUDAPATH=/usr/local/cuda
+CUDAPATH ?= /usr/local/cuda
+NVCC ?= $(CUDAPATH)/bin/nvcc
+CXX ?= g++
 
-# Have this point to an old enough gcc (for nvcc)
-GCCPATH=/usr
+# compute_60 PTX runs on Pascal and newer GPUs. CUDA 12.9 is the last toolkit
+# release that can build this baseline and whose cuBLAS supports Pascal/Volta.
+# With CUDA 13+, use COMPUTE=75 for Turing and newer GPUs.
+COMPUTE ?= 60
 
-NVCC=nvcc
-CCPATH=${GCCPATH}/bin
+CPPFLAGS += -I$(CUDAPATH)/include -DMIN_COMPUTE=$(COMPUTE)
+CXXFLAGS += -O3 -std=c++11 -Wall -Wextra
+NVCCFLAGS += -arch=compute_$(COMPUTE) -ptx
+LDFLAGS += -L$(CUDAPATH)/lib64 -L$(CUDAPATH)/lib
+LDFLAGS += -Wl,-rpath,$(CUDAPATH)/lib64 -Wl,-rpath,$(CUDAPATH)/lib
+LDLIBS += -lcuda -lcublasLt -lcublas -lcudart
 
-drv:
-	PATH=${PATH}:.:${CCPATH}:${PATH} ${NVCC} -arch=compute_20 -ptx compare.cu -o compare.ptx
-	g++ -O3 -Wno-unused-result -I${CUDAPATH}/include -c gpu_burn-drv.cpp
-	g++ -o gpu_burn gpu_burn-drv.o -O3 -lcuda -L${CUDAPATH}/lib64 -L${CUDAPATH}/lib -Wl,-rpath=${CUDAPATH}/lib64 -Wl,-rpath=${CUDAPATH}/lib -lcublas -lcudart -o gpu_burn
+.PHONY: all drv clean
+
+all: drv
+
+drv: gpu_burn
+
+compare.ptx: compare.cu
+	$(NVCC) $(NVCCFLAGS) $< -o $@
+
+gpu_burn-drv.o: gpu_burn-drv.cpp
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+gpu_burn: compare.ptx gpu_burn-drv.o
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) gpu_burn-drv.o $(LDLIBS) -o $@
+
+clean:
+	rm -f compare.ptx gpu_burn-drv.o gpu_burn
