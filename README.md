@@ -25,6 +25,25 @@ Options
 The program returns a non-zero exit status if a GPU reports calculation errors,
 a worker process dies, or CUDA initialization fails.
 
+## SLURM
+
+The included `gpu_burn.slurm` sample requests one GPU on one node in the
+`compute` partition, builds the program, and runs a 10-minute FP32 burn:
+
+```
+sbatch gpu_burn.slurm
+```
+
+Override the runtime settings at submission:
+
+```
+sbatch --export=ALL,PRECISION=fp16,DURATION=600,MEMORY_PERCENT=90 gpu_burn.slurm
+```
+
+Change `#SBATCH --gpus-per-node=1` in the job file to request more GPUs. The
+program automatically runs one worker for every GPU exposed to the job by
+SLURM.
+
 ## Building and GPU support
 
 Build with:
@@ -33,8 +52,41 @@ Build with:
 make
 ```
 
-Override `CUDAPATH`, `NVCC`, or `CXX` when the CUDA Toolkit is installed in a
-non-default location.
+For systems using an NVIDIA HPC SDK environment module:
+
+```
+module load nvhpc
+make
+```
+
+No build arguments are normally required in either case. The Makefile detects
+the standard `/usr/local/cuda` installation, common CUDA environment variables,
+and the CUDA version bundled with an NVHPC module. It also searches the NVHPC
+`math_libs/<version>` tree and selects `nvc++` when it is provided by the
+module.
+
+When switching between CUDA installations, rebuild from clean sources:
+
+```
+make clean
+make
+```
+
+Use `make print-config` to inspect the detected paths. Override `CUDAPATH`,
+`NVCC`, or `CXX` only for unusual installations.
+
+The CUDA Driver API library (`libcuda.so`) is supplied by the installed NVIDIA
+driver rather than the CUDA Toolkit. When the development symlink is not
+installed system-wide, the Makefile links against the toolkit's
+`targets/<platform>/lib/stubs/libcuda.so`. The stub directory is deliberately
+excluded from runtime `rpath`, so execution still uses the real driver library.
+If `make print-config` reports an empty `CUDA_DRIVER_LIBRARY_DIRS`, locate the
+stub and pass its directory explicitly:
+
+```
+find /opt/nvidia/hpc_sdk -path '*/lib/stubs/libcuda.so' -print
+make CUDA_DRIVER_LIBRARY_DIRS=/path/containing/libcuda.so
+```
 
 The default build emits `compute_60` PTX. This supports Pascal, Volta, and newer
 GPUs, and lets the installed NVIDIA driver JIT-compile the small comparison

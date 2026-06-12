@@ -29,6 +29,7 @@
 
 #define SIZE 2048ul // Matrices are SIZE*SIZE..  2048^2 should be efficiently implemented in CUBLAS
 #define DEFAULT_USEMEM 0.9 // Try to allocate 90% of available memory
+#define DEFAULT_RUN_LENGTH 10 // Burn duration in seconds
 
 // Standard GEMM operation count: SIZE^3 multiplies and SIZE^3 additions.
 #define OPS_PER_MUL (2ull*SIZE*SIZE*SIZE)
@@ -64,6 +65,8 @@ enum BurnMode {
 	MODE_FP8
 };
 
+const BurnMode DEFAULT_MODE = MODE_FP32;
+
 const char *modeName(BurnMode mode) {
 	switch (mode) {
 	case MODE_FP32: return "FP32";
@@ -73,6 +76,17 @@ const char *modeName(BurnMode mode) {
 	case MODE_FP8: return "FP8 E4M3";
 	}
 	return "UNKNOWN";
+}
+
+const char *modeArgumentName(BurnMode mode) {
+	switch (mode) {
+	case MODE_FP32: return "fp32";
+	case MODE_FP64: return "fp64";
+	case MODE_FP16: return "fp16";
+	case MODE_BF16: return "bf16";
+	case MODE_FP8: return "fp8";
+	}
+	return "unknown";
 }
 
 int modeMinCompute(BurnMode mode) {
@@ -120,6 +134,15 @@ void checkError(cublasStatus_t rCode, const std::string &desc = "") {
 			std::string("Error: ") :
 			(std::string("Error in \"") + desc + "\": ")) +
 		cublasGetStatusString(rCode);
+}
+
+void getComputeCapability(CUdevice device, int *major, int *minor) {
+	checkError(cuDeviceGetAttribute(major,
+				CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device),
+			"compute capability major");
+	checkError(cuDeviceGetAttribute(minor,
+				CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device),
+			"compute capability minor");
 }
 
 class BurnTest {
@@ -197,7 +220,7 @@ public:
 		char deviceName[256];
 		int major, minor;
 		checkError(cuDeviceGetName(deviceName, sizeof(deviceName), d_dev), "device name");
-		checkError(cuDeviceComputeCapability(&major, &minor, d_dev), "compute capability");
+		getComputeCapability(d_dev, &major, &minor);
 		const int minCompute = modeMinCompute(d_mode);
 		if (major*10 + minor < minCompute)
 			throw std::string("This build requires compute capability ") +
@@ -365,7 +388,7 @@ public:
 		char deviceName[256];
 		int major, minor;
 		checkError(cuDeviceGetName(deviceName, sizeof(deviceName), d_dev), "device name");
-		checkError(cuDeviceComputeCapability(&major, &minor, d_dev), "compute capability");
+		getComputeCapability(d_dev, &major, &minor);
 		const int minCompute = modeMinCompute(d_mode);
 		if (major*10 + minor < minCompute)
 			throw std::string(modeName(d_mode)) + " Tensor Core mode requires compute capability " +
@@ -932,79 +955,95 @@ bool launch(int runLength, BurnMode mode, double useMemory) {
 
 		close(writeFd);
 		return false;
-	} else {
-		clientPids.push_back(myPid);
-		bool spawnFailure = false;
+	}
 
-		close(mainPipe[1]);
-		int devCount = -1;
-		if (!readAll(readMain, &devCount, sizeof(devCount)))
-			devCount = -1;
+	clientPids.push_back(myPid);
+	bool spawnFailure = false;
 
-		if (devCount <= 0) {
-			fprintf(stderr, "No usable CUDA devices\n");
-			waitpid(myPid, NULL, 0);
-			close(readMain);
-			free(A);
-			free(B);
-			return false;
-		} else {
-			for (int i = 1; i < devCount; ++i) {
-				int slavePipe[2];
-				if (pipe(slavePipe) != 0) {
-					perror("pipe");
-					spawnFailure = true;
-					continue;
-				}
-				clientPipes.push_back(slavePipe[0]);
+	close(mainPipe[1]);
+	int devCount = -1;
+	if (!readAll(readMain, &devCount, sizeof(devCount)))
+		devCount = -1;
 
-				pid_t slavePid = fork();
-				if (slavePid < 0) {
-					perror("fork");
-					close(slavePipe[0]);
-					close(slavePipe[1]);
-					clientPipes.pop_back();
-					spawnFailure = true;
-					continue;
-				}
+	if (devCount <= 0) {
+		fprintf(stderr, "No usable CUDA devices\n");
+		waitpid(myPid, NULL, 0);
+		close(readMain);
+		free(A);
+		free(B);
+		return false;
+	}
 
-				if (!slavePid) {
-					// Child
-					close(slavePipe[0]);
-					try {
-						initCuda();
-						startBurn(i, slavePipe[1], A, B, mode, useMemory);
-					} catch (const std::string &e) {
-						fprintf(stderr, "Could not initialize GPU %d: %s\n", i, e.c_str());
-						ClientReport report = { 0, 0, -1 };
-						writeReport(slavePipe[1], report);
-					}
+	for (int i = 1; i < devCount; ++i) {
+		int slavePipe[2];
+		if (pipe(slavePipe) != 0) {
+			perror("pipe");
+			spawnFailure = true;
+			continue;
+		}
+		clientPipes.push_back(slavePipe[0]);
 
-					close(slavePipe[1]);
-					return false;
-				} else {
-					clientPids.push_back(slavePid);
-					close(slavePipe[1]);
-				}
+		pid_t slavePid = fork();
+		if (slavePid < 0) {
+			perror("fork");
+			close(slavePipe[0]);
+			close(slavePipe[1]);
+			clientPipes.pop_back();
+			spawnFailure = true;
+			continue;
+		}
+
+		if (!slavePid) {
+			// Child
+			close(slavePipe[0]);
+			try {
+				initCuda();
+				startBurn(i, slavePipe[1], A, B, mode, useMemory);
+			} catch (const std::string &e) {
+				fprintf(stderr, "Could not initialize GPU %d: %s\n", i, e.c_str());
+				ClientReport report = { 0, 0, -1 };
+				writeReport(slavePipe[1], report);
 			}
 
-			bool success = listenClients(clientPipes, clientPids, runLength);
-			for (size_t i = 0; i < clientPipes.size(); ++i)
-				close(clientPipes.at(i));
-			free(A);
-			free(B);
-			return success && !spawnFailure;
+			close(slavePipe[1]);
+			return false;
+		} else {
+			clientPids.push_back(slavePid);
+			close(slavePipe[1]);
 		}
 	}
 
+	bool success = listenClients(clientPipes, clientPids, runLength);
+	for (size_t i = 0; i < clientPipes.size(); ++i)
+		close(clientPipes.at(i));
 	free(A);
 	free(B);
-	return false;
+	return success && !spawnFailure;
+}
+
+void printHelp(const char *programName) {
+	printf("usage: %s [-h] [-d] [-p {fp32,fp64,fp16,bf16,fp8}] "
+			"[-m PERCENT] [duration]\n"
+			"\n"
+			"positional arguments:\n"
+			"  duration              burn duration in seconds (default: %d)\n"
+			"\n"
+			"options:\n"
+			"  -h, --help            show this help message and exit\n"
+			"  -d, --double          compatibility alias for --precision fp64 "
+			"(default: false)\n"
+			"  -p {fp32,fp64,fp16,bf16,fp8}, --precision {fp32,fp64,fp16,bf16,fp8}\n"
+			"                        calculation precision (default: %s)\n"
+			"  -m PERCENT, --memory PERCENT\n"
+			"                        percentage of available GPU memory to use "
+			"(default: %.0f)\n",
+			programName, DEFAULT_RUN_LENGTH, modeArgumentName(DEFAULT_MODE),
+			DEFAULT_USEMEM * 100.0);
 }
 
 int main(int argc, char **argv) {
-	int runLength = 10;
-	BurnMode mode = MODE_FP32;
+	int runLength = DEFAULT_RUN_LENGTH;
+	BurnMode mode = DEFAULT_MODE;
 	bool durationSpecified = false;
 	double useMemory = DEFAULT_USEMEM;
 
@@ -1049,8 +1088,7 @@ int main(int argc, char **argv) {
 			}
 			useMemory = percent / 100.0;
 		} else if (arg == "-h" || arg == "--help") {
-			printf("Usage: %s [-p|--precision fp32|fp64|fp16|bf16|fp8] "
-					"[-m|--memory percent] [duration]\n", argv[0]);
+			printHelp(argv[0]);
 			return 0;
 		} else if (!durationSpecified) {
 			char *end = NULL;
@@ -1068,7 +1106,8 @@ int main(int argc, char **argv) {
 	}
 
 	if (!durationSpecified)
-		printf("Run length not specified in the command line.  Burning for 10 secs\n");
+		printf("Run length not specified in the command line.  Burning for %d secs\n",
+				DEFAULT_RUN_LENGTH);
 
 	return launch(runLength, mode, useMemory) ? 0 : 1;
 }
