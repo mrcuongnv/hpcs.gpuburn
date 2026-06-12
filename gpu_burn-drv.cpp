@@ -30,6 +30,10 @@
 #define SIZE 2048ul // Matrices are SIZE*SIZE..  2048^2 should be efficiently implemented in CUBLAS
 #define DEFAULT_USEMEM 0.9 // Try to allocate 90% of available memory
 #define DEFAULT_RUN_LENGTH 10 // Burn duration in seconds
+#define DEFAULT_THROTTLE_TEMP 85 // Temperature threshold for possible throttle detection
+#define THROTTLE_DROP_RATIO 0.10 // Performance drop from observed peak considered noticeable
+#define THROTTLE_SAMPLE_COUNT 3 // Consecutive low-performance samples required
+#define PROGRESS_BAR_WIDTH 20
 
 // Standard GEMM operation count: SIZE^3 multiplies and SIZE^3 additions.
 #define OPS_PER_MUL (2ull*SIZE*SIZE*SIZE)
@@ -710,7 +714,72 @@ double monotonicSeconds() {
 	return (double)now.tv_sec + (double)now.tv_nsec / 1000000000.0;
 }
 
-bool listenClients(const std::vector<int> &clientFd, const std::vector<pid_t> &clientPid, int runTime) {
+std::string progressBar(float percent) {
+	std::string bar(PROGRESS_BAR_WIDTH, '-');
+	size_t completed = static_cast<size_t>(percent / 100.0f * PROGRESS_BAR_WIDTH);
+	if (completed > PROGRESS_BAR_WIDTH)
+		completed = PROGRESS_BAR_WIDTH;
+	for (size_t i = 0; i < completed; ++i)
+		bar.at(i) = '#';
+	if (completed < PROGRESS_BAR_WIDTH)
+		bar.at(completed) = '>';
+	return bar;
+}
+
+struct PerformanceThrottleState {
+	PerformanceThrottleState() : peakTflops(0.0), lowSamples(0), active(false), ever(false) {}
+
+	double peakTflops;
+	unsigned int lowSamples;
+	bool active;
+	bool ever;
+};
+
+void updatePerformanceThrottle(PerformanceThrottleState *state, double tflops,
+		int temperature, int throttleTemp) {
+	if (tflops > state->peakTflops)
+		state->peakTflops = tflops;
+
+	const bool noticeableDrop = state->peakTflops > 0.0 &&
+		tflops <= state->peakTflops * (1.0 - THROTTLE_DROP_RATIO);
+	if (temperature >= throttleTemp && noticeableDrop)
+		++state->lowSamples;
+	else
+		state->lowSamples = 0;
+	state->active = state->lowSamples >= THROTTLE_SAMPLE_COUNT;
+	state->ever = state->ever || state->active;
+}
+
+void printDashboard(float elapsed, const std::vector<uint64_t> &clientCalcs,
+		const std::vector<double> &clientTflops, const std::vector<uint64_t> &clientErrors,
+		const std::vector<int> &clientTemp, const std::vector<bool> &clientDied,
+		const std::vector<PerformanceThrottleState> &clientThrottle,
+		bool interactive, bool clearPrevious) {
+	if (interactive && clearPrevious)
+		printf("\033[%zuA", clientCalcs.size());
+
+	const std::string bar = progressBar(elapsed);
+	for (size_t i = 0; i < clientCalcs.size(); ++i) {
+		if (interactive)
+			printf("\r\033[2K");
+		const char *status = clientDied.at(i) ? "DIED!" :
+			(clientErrors.at(i) ? "WARNING!" :
+			(clientThrottle.at(i).active ? "POSSIBLE THERMAL THROTTLE" : "OK"));
+		printf("GPU %zu [%s] %5.1f%% | %7.2f TFLOP/s | ",
+				i, bar.c_str(), elapsed, clientTflops.at(i));
+		if (clientTemp.at(i))
+			printf("%3d C", clientTemp.at(i));
+		else
+			printf("  -- ");
+		printf(" | %llu errors | %llu GEMMs | %s\n",
+				(unsigned long long)clientErrors.at(i),
+				(unsigned long long)clientCalcs.at(i), status);
+	}
+	fflush(stdout);
+}
+
+bool listenClients(const std::vector<int> &clientFd, const std::vector<pid_t> &clientPid,
+		int runTime, int throttleTemp) {
 	pid_t tempPid;
 	int tempHandle = pollTemp(&tempPid);
 	int maxHandle = tempHandle;
@@ -724,7 +793,8 @@ bool listenClients(const std::vector<int> &clientFd, const std::vector<pid_t> &c
 	std::vector<uint64_t> clientErrors(clientFd.size(), 0);
 	std::vector<uint64_t> clientCalcs(clientFd.size(), 0);
 	std::vector<double> clientUpdateTime(clientFd.size(), 0.0);
-	std::vector<double> clientGflops(clientFd.size(), 0.0);
+	std::vector<double> clientTflops(clientFd.size(), 0.0);
+	std::vector<PerformanceThrottleState> clientThrottle(clientFd.size());
 	std::vector<bool> clientFaulty(clientFd.size(), false);
 	std::vector<bool> clientAlive(clientFd.size(), true);
 	std::vector<bool> clientDied(clientFd.size(), false);
@@ -732,7 +802,9 @@ bool listenClients(const std::vector<int> &clientFd, const std::vector<pid_t> &c
 
 	const double startTime = monotonicSeconds();
 	float nextReport = 10.0f;
-	bool childReport = false;
+	double nextDisplayTime = startTime;
+	const bool interactive = isatty(STDOUT_FILENO);
+	bool dashboardVisible = false;
 	bool ranFullDuration = true;
 	while (true) {
 		double thisTime = monotonicSeconds();
@@ -778,13 +850,16 @@ bool listenClients(const std::vector<int> &clientFd, const std::vector<pid_t> &c
 				clientFaulty.at(i) = clientFaulty.at(i) || report.errors != 0;
 				if (clientUpdateTime.at(i) != 0.0) {
 					const double delta = thisTime - clientUpdateTime.at(i);
-					clientGflops.at(i) = (double)report.processed * (double)OPS_PER_MUL /
-						delta / 1000.0 / 1000.0 / 1000.0;
+					if (delta > 0.0) {
+						clientTflops.at(i) = (double)report.processed * (double)OPS_PER_MUL /
+							delta / 1000.0 / 1000.0 / 1000.0 / 1000.0;
+						updatePerformanceThrottle(&clientThrottle.at(i), clientTflops.at(i),
+								clientTemp.at(i), throttleTemp);
+					}
 				}
 				clientUpdateTime.at(i) = thisTime;
 				clientCalcs.at(i) += report.processed;
 				clientReported.at(i) = true;
-				childReport = true;
 			}
 
 		if (tempHandle >= 0 && FD_ISSET(tempHandle, &waitHandles) &&
@@ -793,40 +868,26 @@ bool listenClients(const std::vector<int> &clientFd, const std::vector<pid_t> &c
 			tempHandle = -1;
 		}
 
-		if (childReport) {
-			float elapsed = fminf((float)(thisTime-startTime)/(float)runTime*100.0f, 100.0f);
-			printf("\r%.1f%%  ", elapsed);
-			printf("proc'd: ");
-			for (size_t i = 0; i < clientCalcs.size(); ++i) {
-				printf("%llu (%.0f Gflop/s)%s ",
-						(unsigned long long)clientCalcs.at(i), clientGflops.at(i),
-						clientDied.at(i) ? " (DIED!)" : "");
-				if (i != clientCalcs.size() - 1)
-					printf("- ");
-			}
-			printf("  errors: ");
-			for (size_t i = 0; i < clientErrors.size(); ++i) {
-				printf("%llu%s ", (unsigned long long)clientErrors.at(i),
-						clientErrors.at(i) ? " (WARNING!)" : "");
-				if (i != clientCalcs.size() - 1)
-					printf("- ");
-			}
-			printf("  temps: ");
-			for (size_t i = 0; i < clientTemp.size(); ++i) {
-				printf(clientTemp.at(i) != 0 ? "%d C " : "-- ", clientTemp.at(i));
-				if (i != clientCalcs.size() - 1)
-					printf("- ");
-			}
+		bool anyReported = false;
+		for (size_t i = 0; i < clientReported.size(); ++i)
+			anyReported = anyReported || clientReported.at(i);
 
-			fflush(stdout);
+		float elapsed = fminf((float)(thisTime-startTime)/(float)runTime*100.0f, 100.0f);
+		const bool summaryDue = nextReport < elapsed;
+		if (anyReported && (thisTime >= nextDisplayTime || summaryDue)) {
+			printDashboard(elapsed, clientCalcs, clientTflops, clientErrors, clientTemp,
+					clientDied, clientThrottle, interactive, dashboardVisible);
+			dashboardVisible = interactive;
+			nextDisplayTime = thisTime + (interactive ? 1.0 : 5.0);
+		}
 
-			if (nextReport < elapsed) {
-				nextReport = elapsed + 10.0f;
-				time_t wallTime = time(NULL);
-				char timeText[64];
-				strftime(timeText, sizeof(timeText), "%Y-%m-%d %H:%M:%S", localtime(&wallTime));
-				printf("\n\tSummary at: %s\n", timeText);
-			}
+		if (summaryDue) {
+			nextReport = elapsed + 10.0f;
+			time_t wallTime = time(NULL);
+			char timeText[64];
+			strftime(timeText, sizeof(timeText), "%Y-%m-%d %H:%M:%S", localtime(&wallTime));
+			printf("\tSummary at: %s\n", timeText);
+			dashboardVisible = false;
 		}
 
 		bool oneAlive = false;
@@ -837,6 +898,16 @@ bool listenClients(const std::vector<int> &clientFd, const std::vector<pid_t> &c
 			ranFullDuration = false;
 			break;
 		}
+	}
+
+	bool anyReported = false;
+	for (size_t i = 0; i < clientReported.size(); ++i)
+		anyReported = anyReported || clientReported.at(i);
+	if (anyReported) {
+		const float finalElapsed = ranFullDuration ? 100.0f :
+			fminf((float)(monotonicSeconds()-startTime)/(float)runTime*100.0f, 100.0f);
+		printDashboard(finalElapsed, clientCalcs, clientTflops, clientErrors, clientTemp,
+				clientDied, clientThrottle, interactive, dashboardVisible);
 	}
 
 	printf("\nKilling processes.. ");
@@ -857,7 +928,8 @@ bool listenClients(const std::vector<int> &clientFd, const std::vector<pid_t> &c
 	for (size_t i = 0; i < clientPid.size(); ++i) {
 		const char *status = clientDied.at(i) ? "DIED" :
 			(!clientReported.at(i) ? "NO RESULTS" : (clientFaulty.at(i) ? "FAULTY" : "OK"));
-		printf("\tGPU %d: %s\n", (int)i, status);
+		printf("\tGPU %d: %s%s\n", (int)i, status,
+				clientThrottle.at(i).ever ? " (POSSIBLE THERMAL THROTTLE OBSERVED)" : "");
 		success = success && !clientDied.at(i) && clientReported.at(i) && !clientFaulty.at(i);
 	}
 	return success;
@@ -900,7 +972,7 @@ void initHostInputs(BurnMode mode, void *A, void *B) {
 	}
 }
 
-bool launch(int runLength, BurnMode mode, double useMemory) {
+bool launch(int runLength, BurnMode mode, double useMemory, int throttleTemp) {
 	system("nvidia-smi -L");
 
 	// Initting A and B with random data
@@ -1013,7 +1085,7 @@ bool launch(int runLength, BurnMode mode, double useMemory) {
 		}
 	}
 
-	bool success = listenClients(clientPipes, clientPids, runLength);
+	bool success = listenClients(clientPipes, clientPids, runLength, throttleTemp);
 	for (size_t i = 0; i < clientPipes.size(); ++i)
 		close(clientPipes.at(i));
 	free(A);
@@ -1023,7 +1095,7 @@ bool launch(int runLength, BurnMode mode, double useMemory) {
 
 void printHelp(const char *programName) {
 	printf("usage: %s [-h] [-d] [-p {fp32,fp64,fp16,bf16,fp8}] "
-			"[-m PERCENT] [duration]\n"
+			"[-m PERCENT] [-t TEMP] [duration]\n"
 			"\n"
 			"positional arguments:\n"
 			"  duration              burn duration in seconds (default: %d)\n"
@@ -1036,9 +1108,12 @@ void printHelp(const char *programName) {
 			"                        calculation precision (default: %s)\n"
 			"  -m PERCENT, --memory PERCENT\n"
 			"                        percentage of available GPU memory to use "
-			"(default: %.0f)\n",
+			"(default: %.0f)\n"
+			"  -t TEMP, --throttle-temp TEMP\n"
+			"                        temperature threshold in C for possible thermal "
+			"throttle detection (default: %d)\n",
 			programName, DEFAULT_RUN_LENGTH, modeArgumentName(DEFAULT_MODE),
-			DEFAULT_USEMEM * 100.0);
+			DEFAULT_USEMEM * 100.0, DEFAULT_THROTTLE_TEMP);
 }
 
 int main(int argc, char **argv) {
@@ -1046,6 +1121,7 @@ int main(int argc, char **argv) {
 	BurnMode mode = DEFAULT_MODE;
 	bool durationSpecified = false;
 	double useMemory = DEFAULT_USEMEM;
+	int throttleTemp = DEFAULT_THROTTLE_TEMP;
 
 	for (int i = 1; i < argc; ++i) {
 		const std::string arg(argv[i]);
@@ -1087,6 +1163,18 @@ int main(int argc, char **argv) {
 				return 2;
 			}
 			useMemory = percent / 100.0;
+		} else if (arg == "-t" || arg == "--throttle-temp") {
+			if (++i >= argc) {
+				fprintf(stderr, "%s requires a temperature\n", arg.c_str());
+				return 2;
+			}
+			char *end = NULL;
+			long temperature = strtol(argv[i], &end, 10);
+			if (!end || *end || temperature <= 0 || temperature > 120) {
+				fprintf(stderr, "Throttle temperature must be between 1 and 120 C\n");
+				return 2;
+			}
+			throttleTemp = static_cast<int>(temperature);
 		} else if (arg == "-h" || arg == "--help") {
 			printHelp(argv[0]);
 			return 0;
@@ -1109,5 +1197,5 @@ int main(int argc, char **argv) {
 		printf("Run length not specified in the command line.  Burning for %d secs\n",
 				DEFAULT_RUN_LENGTH);
 
-	return launch(runLength, mode, useMemory) ? 0 : 1;
+	return launch(runLength, mode, useMemory, throttleTemp) ? 0 : 1;
 }

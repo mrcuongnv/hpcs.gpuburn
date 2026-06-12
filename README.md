@@ -12,7 +12,8 @@ From http://wili.cc/blog/gpu-burn.html
 Syntax:
 
 ```
-gpu_burn [-p|--precision fp32|fp64|fp16|bf16|fp8] [-m|--memory percent] [duration=10]
+gpu_burn [-p|--precision fp32|fp64|fp16|bf16|fp8] [-m|--memory percent] \
+  [-t|--throttle-temp temperature] [duration=10]
 ```
 
 Options
@@ -20,10 +21,22 @@ Options
 * `-p precision`: select the GEMM input precision. Default is `fp32`.
 * `-d`: compatibility alias for `--precision fp64`.
 * `-m percent`: use this percentage of currently available GPU memory. Default is 90.
+* `-t temperature`: temperature threshold in Celsius for possible thermal
+  throttle detection. Default is 85.
 * `duration`: the running length in seconds. Default is 10 seconds.
 
 The program returns a non-zero exit status if a GPU reports calculation errors,
 a worker process dies, or CUDA initialization fails.
+
+Progress is displayed on one line per GPU, including a progress bar, current
+performance in TFLOP/s, temperature, error count, completed GEMMs, and status.
+On an interactive terminal the lines are updated in place.
+
+Possible thermal throttling is reported when a GPU remains at or above the
+configured temperature threshold while performance is at least 10% below its
+observed peak for three consecutive samples. This is a correlation-based
+warning, not definitive proof of a hardware throttle event, and it does not
+change the program's exit status.
 
 ## SLURM
 
