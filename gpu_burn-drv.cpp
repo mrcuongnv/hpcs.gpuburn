@@ -34,6 +34,7 @@
 #define THROTTLE_DROP_RATIO 0.10 // Performance drop from observed peak considered noticeable
 #define THROTTLE_SAMPLE_COUNT 3 // Consecutive low-performance samples required
 #define PROGRESS_BAR_WIDTH 20
+#define STATUS_LINE_MAX 100
 
 // Standard GEMM operation count: SIZE^3 multiplies and SIZE^3 additions.
 #define OPS_PER_MUL (2ull*SIZE*SIZE*SIZE)
@@ -658,9 +659,9 @@ void startBurn(int index, int writeFd, const void *A, const void *B,
 	}
 }
 
-int pollTemp(pid_t *p) {
-	int tempPipe[2];
-	if (pipe(tempPipe) != 0) {
+int pollTelemetry(pid_t *p) {
+	int telemetryPipe[2];
+	if (pipe(telemetryPipe) != 0) {
 		*p = -1;
 		return -1;
 	}
@@ -668,28 +669,28 @@ int pollTemp(pid_t *p) {
 	pid_t myPid = fork();
 
 	if (!myPid) {
-		close(tempPipe[0]);
-		dup2(tempPipe[1], STDOUT_FILENO); // Stdout
-		execlp("nvidia-smi", "nvidia-smi", "--query-gpu=temperature.gpu",
+		close(telemetryPipe[0]);
+		dup2(telemetryPipe[1], STDOUT_FILENO); // Stdout
+		execlp("nvidia-smi", "nvidia-smi", "--query-gpu=temperature.gpu,power.draw",
 				"--format=csv,noheader,nounits", "-l", "5", NULL);
-		fprintf(stderr, "Could not invoke nvidia-smi, no temps available\n");
+		fprintf(stderr, "Could not invoke nvidia-smi, no temperature or power data available\n");
 
 		exit(0);
 	}
 	if (myPid < 0) {
-		close(tempPipe[0]);
-		close(tempPipe[1]);
+		close(telemetryPipe[0]);
+		close(telemetryPipe[1]);
 		*p = -1;
 		return -1;
 	}
 
 	*p = myPid;
-	close(tempPipe[1]);
+	close(telemetryPipe[1]);
 
-	return tempPipe[0];
+	return telemetryPipe[0];
 }
 
-bool updateTemps(int handle, std::vector<int> *temps) {
+bool updateTelemetry(int handle, std::vector<int> *temps, std::vector<double> *power) {
 	const size_t readSize = 128;
 	static size_t gpuIter = 0;
 	char data[readSize];
@@ -706,13 +707,23 @@ bool updateTemps(int handle, std::vector<int> *temps) {
 	}
 	data[curPos] = 0;
 
+	char *powerText = strchr(data, ',');
+	if (powerText)
+		*powerText++ = 0;
+
 	char *end = NULL;
 	long tempValue = strtol(data, &end, 10);
 	if (end != data)
 		temps->at(gpuIter) = static_cast<int>(tempValue);
-	if (end != data || strstr(data, "N/A")) {
-		gpuIter = (gpuIter+1)%(temps->size());
+
+	if (powerText) {
+		end = NULL;
+		double powerValue = strtod(powerText, &end);
+		if (end != powerText)
+			power->at(gpuIter) = powerValue;
 	}
+
+	gpuIter = (gpuIter+1)%(temps->size());
 	return true;
 }
 
@@ -732,6 +743,23 @@ std::string progressBar(float percent) {
 	if (completed < PROGRESS_BAR_WIDTH)
 		bar.at(completed) = '>';
 	return bar;
+}
+
+std::string compactCount(uint64_t value) {
+	static const char suffix[] = "kMGTPE";
+	if (value < 1000)
+		return std::to_string(value);
+
+	double compact = static_cast<double>(value);
+	size_t suffixIndex = 0;
+	while (compact >= 1000.0 && suffixIndex + 1 < sizeof(suffix)) {
+		compact /= 1000.0;
+		++suffixIndex;
+	}
+
+	char text[16];
+	snprintf(text, sizeof(text), "%.1f%c", compact, suffix[suffixIndex-1]);
+	return text;
 }
 
 struct PerformanceThrottleState {
@@ -760,7 +788,8 @@ void updatePerformanceThrottle(PerformanceThrottleState *state, double tflops,
 
 void printDashboard(float elapsed, const std::vector<uint64_t> &clientCalcs,
 		const std::vector<double> &clientTflops, const std::vector<uint64_t> &clientErrors,
-		const std::vector<int> &clientTemp, const std::vector<bool> &clientDied,
+		const std::vector<int> &clientTemp, const std::vector<double> &clientPower,
+		const std::vector<bool> &clientDied,
 		const std::vector<PerformanceThrottleState> &clientThrottle,
 		bool interactive, bool clearPrevious) {
 	if (interactive && clearPrevious)
@@ -770,27 +799,35 @@ void printDashboard(float elapsed, const std::vector<uint64_t> &clientCalcs,
 	for (size_t i = 0; i < clientCalcs.size(); ++i) {
 		if (interactive)
 			printf("\r\033[2K");
-		const char *status = clientDied.at(i) ? "DIED!" :
-			(clientErrors.at(i) ? "WARNING!" :
-			(clientThrottle.at(i).active ? "POSSIBLE THERMAL THROTTLE" : "OK"));
-		printf("GPU %zu [%s] %5.1f%% | %7.2f TFLOP/s | ",
-				i, bar.c_str(), elapsed, clientTflops.at(i));
+		const char *status = clientDied.at(i) ? "DIED" :
+			(clientErrors.at(i) ? "WARNING" :
+			(clientThrottle.at(i).active ? "THROTTLE" : "OK"));
+		char tempText[8];
 		if (clientTemp.at(i))
-			printf("%3d C", clientTemp.at(i));
+			snprintf(tempText, sizeof(tempText), "%dC", clientTemp.at(i));
 		else
-			printf("  -- ");
-		printf(" | %llu errors | %llu GEMMs | %s\n",
-				(unsigned long long)clientErrors.at(i),
-				(unsigned long long)clientCalcs.at(i), status);
+			snprintf(tempText, sizeof(tempText), "--C");
+		char powerText[12];
+		if (clientPower.at(i) > 0.0)
+			snprintf(powerText, sizeof(powerText), "%.0fW", clientPower.at(i));
+		else
+			snprintf(powerText, sizeof(powerText), "---W");
+
+		char line[STATUS_LINE_MAX+1];
+		snprintf(line, sizeof(line),
+				"GPU %zu [%s] %5.1f%% | %7.2f TF/s | %4s %5s | %-8s | e=%s g=%s",
+				i, bar.c_str(), elapsed, clientTflops.at(i), tempText, powerText, status,
+				compactCount(clientErrors.at(i)).c_str(), compactCount(clientCalcs.at(i)).c_str());
+		printf("%s\n", line);
 	}
 	fflush(stdout);
 }
 
 bool listenClients(const std::vector<int> &clientFd, const std::vector<pid_t> &clientPid,
 		int runTime, int throttleTemp) {
-	pid_t tempPid;
-	int tempHandle = pollTemp(&tempPid);
-	int maxHandle = tempHandle;
+	pid_t telemetryPid;
+	int telemetryHandle = pollTelemetry(&telemetryPid);
+	int maxHandle = telemetryHandle;
 
 	for (size_t i = 0; i < clientFd.size(); ++i) {
 		if (clientFd.at(i) > maxHandle)
@@ -798,6 +835,7 @@ bool listenClients(const std::vector<int> &clientFd, const std::vector<pid_t> &c
 	}
 
 	std::vector<int> clientTemp(clientFd.size(), 0);
+	std::vector<double> clientPower(clientFd.size(), 0.0);
 	std::vector<uint64_t> clientErrors(clientFd.size(), 0);
 	std::vector<uint64_t> clientCalcs(clientFd.size(), 0);
 	std::vector<double> clientUpdateTime(clientFd.size(), 0.0);
@@ -821,8 +859,8 @@ bool listenClients(const std::vector<int> &clientFd, const std::vector<pid_t> &c
 
 		fd_set waitHandles;
 		FD_ZERO(&waitHandles);
-		if (tempHandle >= 0)
-			FD_SET(tempHandle, &waitHandles);
+		if (telemetryHandle >= 0)
+			FD_SET(telemetryHandle, &waitHandles);
 		for (size_t i = 0; i < clientFd.size(); ++i)
 			if (clientAlive.at(i))
 				FD_SET(clientFd.at(i), &waitHandles);
@@ -870,10 +908,10 @@ bool listenClients(const std::vector<int> &clientFd, const std::vector<pid_t> &c
 				clientReported.at(i) = true;
 			}
 
-		if (tempHandle >= 0 && FD_ISSET(tempHandle, &waitHandles) &&
-				!updateTemps(tempHandle, &clientTemp)) {
-			close(tempHandle);
-			tempHandle = -1;
+		if (telemetryHandle >= 0 && FD_ISSET(telemetryHandle, &waitHandles) &&
+				!updateTelemetry(telemetryHandle, &clientTemp, &clientPower)) {
+			close(telemetryHandle);
+			telemetryHandle = -1;
 		}
 
 		bool anyReported = false;
@@ -883,7 +921,7 @@ bool listenClients(const std::vector<int> &clientFd, const std::vector<pid_t> &c
 		float elapsed = fminf((float)(thisTime-startTime)/(float)runTime*100.0f, 100.0f);
 		const bool summaryDue = nextReport < elapsed;
 		if (anyReported && (thisTime >= nextDisplayTime || summaryDue)) {
-			printDashboard(elapsed, clientCalcs, clientTflops, clientErrors, clientTemp,
+			printDashboard(elapsed, clientCalcs, clientTflops, clientErrors, clientTemp, clientPower,
 					clientDied, clientThrottle, interactive, dashboardVisible);
 			dashboardVisible = interactive;
 			nextDisplayTime = thisTime + (interactive ? 1.0 : 5.0);
@@ -914,7 +952,7 @@ bool listenClients(const std::vector<int> &clientFd, const std::vector<pid_t> &c
 	if (anyReported) {
 		const float finalElapsed = ranFullDuration ? 100.0f :
 			fminf((float)(monotonicSeconds()-startTime)/(float)runTime*100.0f, 100.0f);
-		printDashboard(finalElapsed, clientCalcs, clientTflops, clientErrors, clientTemp,
+		printDashboard(finalElapsed, clientCalcs, clientTflops, clientErrors, clientTemp, clientPower,
 				clientDied, clientThrottle, interactive, dashboardVisible);
 	}
 
@@ -923,10 +961,10 @@ bool listenClients(const std::vector<int> &clientFd, const std::vector<pid_t> &c
 	for (size_t i = 0; i < clientPid.size(); ++i)
 		kill(clientPid.at(i), 15);
 
-	if (tempPid > 0)
-		kill(tempPid, 15);
-	if (tempHandle >= 0)
-		close(tempHandle);
+	if (telemetryPid > 0)
+		kill(telemetryPid, 15);
+	if (telemetryHandle >= 0)
+		close(telemetryHandle);
 
 	while (wait(NULL) != -1);
 	printf("done\n");

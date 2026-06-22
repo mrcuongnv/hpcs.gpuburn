@@ -29,8 +29,9 @@ The program returns a non-zero exit status if a GPU reports calculation errors,
 a worker process dies, or CUDA initialization fails.
 
 Progress is displayed on one line per GPU, including a progress bar, current
-performance in TFLOP/s, temperature, error count, completed GEMMs, and status.
-On an interactive terminal the lines are updated in place.
+performance in TFLOP/s, temperature, power draw, error count, completed GEMMs,
+and status. Each GPU status line is limited to 100 characters. On an interactive
+terminal the lines are updated in place.
 
 Possible thermal throttling is reported when a GPU remains at or above the
 configured temperature threshold while performance is at least 10% below its
