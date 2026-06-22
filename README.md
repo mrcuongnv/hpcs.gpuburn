@@ -100,7 +100,9 @@ make COMPUTE="$(./detect_compute.sh)"
 
 For example, the detector prints `89` for an Ada-only system when the selected
 CUDA toolkit supports `compute_89`. On mixed-GPU systems it targets the oldest
-GPU so the resulting comparison PTX can run on all devices.
+GPU so the resulting comparison PTX can run on all devices. If `nvcc` is not in
+`PATH`, the detector checks `CUDAPATH`, `NVHPC_CUDA_HOME`, `CUDA_HOME`,
+`CUDA_PATH`, and `/usr/local/cuda` before asking for an explicit `NVCC` path.
 
 The CUDA Driver API library (`libcuda.so`) is supplied by the installed NVIDIA
 driver rather than the CUDA Toolkit. When the development symlink is not

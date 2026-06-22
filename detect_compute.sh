@@ -2,11 +2,25 @@
 
 set -eu
 
-nvcc=${NVCC:-nvcc}
 nvidia_smi=${NVIDIA_SMI:-nvidia-smi}
 
-if ! command -v "$nvcc" >/dev/null 2>&1; then
-	echo "error: nvcc not found; set NVCC to its path" >&2
+if [ -n "${NVCC:-}" ]; then
+	nvcc=$NVCC
+elif command -v nvcc >/dev/null 2>&1; then
+	nvcc=$(command -v nvcc)
+else
+	nvcc=
+	for cuda_root in "${CUDAPATH:-}" "${NVHPC_CUDA_HOME:-}" \
+			"${CUDA_HOME:-}" "${CUDA_PATH:-}" /usr/local/cuda; do
+		if [ -n "$cuda_root" ] && [ -x "$cuda_root/bin/nvcc" ]; then
+			nvcc=$cuda_root/bin/nvcc
+			break
+		fi
+	done
+fi
+
+if [ -z "$nvcc" ] || ! command -v "$nvcc" >/dev/null 2>&1; then
+	echo "error: nvcc not found in PATH or a standard CUDA location; set NVCC to its path" >&2
 	exit 1
 fi
 
