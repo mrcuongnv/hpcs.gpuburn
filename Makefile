@@ -22,10 +22,12 @@ ifeq ($(origin CXX), default)
 CXX := $(or $(shell command -v nvc++ 2>/dev/null),g++)
 endif
 
-# compute_60 PTX runs on Pascal and newer GPUs. CUDA 12.9 is the last toolkit
-# release that can build this baseline and whose cuBLAS supports Pascal/Volta.
-# With CUDA 13+, use COMPUTE=75 for Turing and newer GPUs.
-COMPUTE ?= 60
+# Use the oldest virtual architecture supported by the selected compiler. This
+# keeps the PTX portable across the widest GPU range that its CUDA toolkit can
+# support (compute_60 through CUDA 12.9, compute_75 starting with CUDA 13).
+NVCC_GPU_ARCHS := $(shell $(NVCC) --list-gpu-arch 2>/dev/null)
+DEFAULT_COMPUTE := $(or $(patsubst compute_%,%,$(firstword $(NVCC_GPU_ARCHS))),60)
+COMPUTE ?= $(DEFAULT_COMPUTE)
 
 # CUDA Toolkit packages may place headers/libraries under targets/<platform>.
 # NVHPC additionally installs cuBLAS and cuBLASLt under math_libs/<version>.
@@ -68,7 +70,7 @@ LDLIBS += -lcuda -lcublasLt -lcublas -lcudart
 
 comma := ,
 
-.PHONY: all drv clean print-config
+.PHONY: all drv clean print-config suggest-compute
 
 all: drv
 
@@ -86,6 +88,8 @@ gpu_burn: compare.ptx gpu_burn-drv.o
 print-config:
 	@echo "NVCC=$(NVCC)"
 	@echo "NVCC_VERSION=$(NVCC_VERSION)"
+	@echo "NVCC_GPU_ARCHS=$(NVCC_GPU_ARCHS)"
+	@echo "COMPUTE=$(COMPUTE)"
 	@echo "CUDAPATH=$(CUDAPATH)"
 	@echo "CXX=$(CXX)"
 	@echo "CUDA_TARGET=$(CUDA_TARGET)"
@@ -94,6 +98,9 @@ print-config:
 	@echo "CUDA_INCLUDE_DIRS=$(CUDA_INCLUDE_DIRS)"
 	@echo "CUDA_LIBRARY_DIRS=$(CUDA_LIBRARY_DIRS)"
 	@echo "CUDA_DRIVER_LIBRARY_DIRS=$(CUDA_DRIVER_LIBRARY_DIRS)"
+
+suggest-compute:
+	@NVCC="$(NVCC)" ./detect_compute.sh
 
 clean:
 	rm -f compare.ptx gpu_burn-drv.o gpu_burn

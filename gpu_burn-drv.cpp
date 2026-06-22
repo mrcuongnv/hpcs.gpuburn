@@ -130,6 +130,14 @@ void checkError(CUresult rCode, const std::string &desc = "") {
 		name + " (" + message + ")";
 }
 
+void createContext(CUcontext *context, CUdevice device) {
+#if CUDA_VERSION >= 13000
+	checkError(cuCtxCreate(context, nullptr, 0, device));
+#else
+	checkError(cuCtxCreate(context, 0, device));
+#endif
+}
+
 void checkError(cublasStatus_t rCode, const std::string &desc = "") {
 	if (rCode == CUBLAS_STATUS_SUCCESS)
 		return;
@@ -166,7 +174,7 @@ public:
 			d_error(0), d_dev(0), d_ctx(0), d_module(0), d_function(0), d_Cdata(0),
 			d_Adata(0), d_Bdata(0), d_faultyElemData(0), d_cublas(0) {
 		checkError(cuDeviceGet(&d_dev, d_devNumber));
-		checkError(cuCtxCreate(&d_ctx, 0, d_dev));
+		createContext(&d_ctx, d_dev);
 		bind();
 		checkError(cublasCreate(&d_cublas), "init");
 	}
@@ -340,7 +348,7 @@ public:
 			d_workspace(0), d_workspaceSize(32ul*1024ul*1024ul), d_lt(0),
 			d_opDesc(0), d_aDesc(0), d_bDesc(0), d_cDesc(0) {
 		checkError(cuDeviceGet(&d_dev, d_devNumber));
-		checkError(cuCtxCreate(&d_ctx, 0, d_dev));
+		createContext(&d_ctx, d_dev);
 		bind();
 		checkError(cublasLtCreate(&d_lt), "cuBLASLt init");
 	}

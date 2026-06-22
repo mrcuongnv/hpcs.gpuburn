@@ -88,6 +88,19 @@ make
 Use `make print-config` to inspect the detected paths. Override `CUDAPATH`,
 `NVCC`, or `CXX` only for unusual installations.
 
+To select the newest compiler-supported architecture that runs on every GPU
+installed in the system, use the dedicated detector:
+
+```
+make suggest-compute
+make clean
+make COMPUTE="$(./detect_compute.sh)"
+```
+
+For example, the detector prints `89` for an Ada-only system when the selected
+CUDA toolkit supports `compute_89`. On mixed-GPU systems it targets the oldest
+GPU so the resulting comparison PTX can run on all devices.
+
 The CUDA Driver API library (`libcuda.so`) is supplied by the installed NVIDIA
 driver rather than the CUDA Toolkit. When the development symlink is not
 installed system-wide, the Makefile links against the toolkit's
@@ -101,14 +114,15 @@ find /opt/nvidia/hpc_sdk -path '*/lib/stubs/libcuda.so' -print
 make CUDA_DRIVER_LIBRARY_DIRS=/path/containing/libcuda.so
 ```
 
-The default build emits `compute_60` PTX. This supports Pascal, Volta, and newer
-GPUs, and lets the installed NVIDIA driver JIT-compile the small comparison
-kernel for newer architectures.
+The default build emits PTX for the oldest virtual architecture supported by
+the selected CUDA compiler. This is `compute_60` through CUDA 12.9 and
+`compute_75` starting with CUDA 13. The installed NVIDIA driver JIT-compiles
+the small comparison kernel for newer architectures.
 
 CUDA 12.9 is the newest toolkit line that supports both the Pascal/Volta
 baseline and current GPUs. CUDA 13 removes offline compilation and library
-support for pre-Turing GPUs. For a CUDA 13 build that only needs Turing and
-newer GPUs, use:
+support for pre-Turing GPUs. The default automatically moves to the Turing
+baseline with CUDA 13; it can also be selected explicitly with:
 
 ```
 make clean
